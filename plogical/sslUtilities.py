@@ -983,6 +983,37 @@ def issueSSLForDomain(domain, adminEmail, sslpath, aliasDomain=None, isHostname=
 
                 if result.returncode == 0:
                     logging.CyberCPLogFileWriter.writeToFile(f"Successfully renewed SSL for {domain}")
+
+                    # BUG FIX: acme.sh --issue/--renew above only updates acme.sh's own
+                    # internal cert store (~/.acme.sh/<domain>*/). It never copies the
+                    # renewed cert to the path the webserver/mail services actually read
+                    # from (/etc/letsencrypt/live/<domain>/). installSSLForDomain() below
+                    # only rewires vhost.conf's cert-path *references* -- it does not copy
+                    # cert bytes either. Without this explicit --install-cert step, every
+                    # subsequent renewal cycle keeps "succeeding" in acme.sh's own
+                    # bookkeeping while the deployed certificate silently stays expired
+                    # forever. acme.sh requires --ecc to match whichever variant (ECC vs
+                    # RSA) the cert was actually issued as, or install-cert fails with
+                    # "no such cert", so detect that from its store layout first.
+                    isEcc = os.path.isdir(os.path.expanduser(f'~/.acme.sh/{domain}_ecc'))
+                    eccFlag = '--ecc' if isEcc else ''
+                    installCommand = (
+                        f'{acmePath} --install-cert -d {domain} {eccFlag} '
+                        f'--key-file /etc/letsencrypt/live/{domain}/privkey.pem '
+                        f'--fullchain-file /etc/letsencrypt/live/{domain}/fullchain.pem '
+                        f'--cert-file /etc/letsencrypt/live/{domain}/cert.pem'
+                    ).strip()
+                    try:
+                        installResult = subprocess.run(installCommand, capture_output=True, text=True, shell=True)
+                    except TypeError:
+                        installResult = subprocess.run(installCommand, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                        universal_newlines=True, shell=True)
+
+                    if installResult.returncode != 0:
+                        logging.CyberCPLogFileWriter.writeToFile(
+                            f"acme.sh --install-cert failed for {domain}, renewed cert was NOT deployed. "
+                            f"stdout: {installResult.stdout} stderr: {installResult.stderr}")
+
                     if sslUtilities.installSSLForDomain(domain, adminEmail) == 1:
                         return [1, "SSL successfully renewed"]
                 else:
